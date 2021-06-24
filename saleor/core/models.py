@@ -2,6 +2,7 @@ import datetime
 from typing import Any
 
 from django.contrib.postgres.indexes import GinIndex
+from django.core.serializers.json import DjangoJSONEncoder
 from django.db import models
 from django.db.models import JSONField  # type: ignore
 from django.db.models import F, Max, Q
@@ -127,3 +128,16 @@ class Job(models.Model):
 
     class Meta:
         abstract = True
+
+
+class JobPayload(models.Model):
+    created_at = models.DateTimeField(auto_now_add=True)
+    status = models.CharField(
+        max_length=50, choices=JobStatus.CHOICES, default=JobStatus.PENDING
+    )
+    payload = JSONField(default=dict, encoder=DjangoJSONEncoder)
+
+
+class JobPayloadThrough(models.Model):
+    job_payload = models.ForeignKey(JobPayload, on_delete=models.CASCADE)
+    task_id = models.CharField(max_length=254)

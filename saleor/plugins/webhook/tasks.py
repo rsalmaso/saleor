@@ -6,10 +6,12 @@ from urllib.parse import urlparse, urlunparse
 
 import boto3
 import requests
+from celery import group
 from google.cloud import pubsub_v1
 from requests.exceptions import RequestException
 
 from ...celeryconf import app
+from ...core.models import JobPayload, JobPayloadThrough
 from ...payment import PaymentError
 from ...site.models import Site
 from ...webhook.event_types import WebhookEventType
@@ -57,13 +59,34 @@ def _get_webhooks_for_event(event_type, webhooks=None):
 
 
 @app.task(compression="zlib")
-def trigger_webhooks_for_event(event_type, data):
+def trigger_webhooks_for_event(event_type, job_payload_id):
     """Send a webhook request for an event as an async task."""
     webhooks = _get_webhooks_for_event(event_type)
+    tasks = []
     for webhook in webhooks:
-        send_webhook_request.delay(
-            webhook.pk, webhook.target_url, webhook.secret_key, event_type, data
+        tasks.append(
+            send_webhook_request.s(
+                webhook.pk,
+                webhook.target_url,
+                webhook.secret_key,
+                event_type,
+                job_payload_id,
+            )
         )
+    if not tasks:
+        return
+
+    job = group(tasks)
+    job.freeze()
+
+    job_payload_through = []
+    for task in job.tasks:
+        job_payload_through.append(
+            JobPayloadThrough(task_id=task.id, job_payload_id=job_payload_id)
+        )
+    JobPayloadThrough.objects.bulk_create(job_payload_through)
+
+    job.apply_async()
 
 
 def trigger_webhook_sync(event_type: str, data: str, app: "App"):
@@ -142,33 +165,54 @@ def send_webhook_using_google_cloud_pubsub(
     )
 
 
+def clean_job_payloads(self, exc, task_id, args, kwargs, einfo):
+    payload_id = args[4]
+    JobPayloadThrough.objects.get(task_id=task_id, job_payload_id=payload_id).delete()
+    job_payload = JobPayload.objects.filter(
+        id=payload_id, jobpayloadthrough__isnull=True
+    )
+    if job_payload:
+        job_payload.delete()
+
+
 @app.task(
     autoretry_for=(RequestException,),
+    throws=(RequestException,),
     retry_backoff=10,
-    retry_kwargs={"max_retries": 5},
+    retry_kwargs={"max_retries": 1},
     compression="zlib",
+    on_success=clean_job_payloads,
+    on_failure=clean_job_payloads,
 )
-def send_webhook_request(webhook_id, target_url, secret, event_type, data):
-    parts = urlparse(target_url)
-    domain = Site.objects.get_current().domain
-    message = data.encode("utf-8")
-    signature = signature_for_payload(message, secret)
-    if parts.scheme.lower() in [WebhookSchemes.HTTP, WebhookSchemes.HTTPS]:
-        send_webhook_using_http(target_url, message, domain, signature, event_type)
-    elif parts.scheme.lower() == WebhookSchemes.AWS_SQS:
-        send_webhook_using_aws_sqs(target_url, message, domain, signature, event_type)
-    elif parts.scheme.lower() == WebhookSchemes.GOOGLE_CLOUD_PUBSUB:
-        send_webhook_using_google_cloud_pubsub(
-            target_url, message, domain, signature, event_type
-        )
+def send_webhook_request(webhook_id, target_url, secret, event_type, job_payload_id):
+    try:
+        data = JobPayload.objects.get(id=job_payload_id)
+    except JobPayload.DoesNotExist:
+        logger.warning(f"something goes wrong ID:{job_payload_id}")
+        raise
     else:
-        raise ValueError("Unknown webhook scheme: %r" % (parts.scheme,))
-    logger.debug(
-        "[Webhook ID:%r] Payload sent to %r for event %r",
-        webhook_id,
-        target_url,
-        event_type,
-    )
+        parts = urlparse(target_url)
+        domain = Site.objects.get_current().domain
+        message = data.payload.encode("utf-8")
+        signature = signature_for_payload(message, secret)
+        if parts.scheme.lower() in [WebhookSchemes.HTTP, WebhookSchemes.HTTPS]:
+            send_webhook_using_http(target_url, message, domain, signature, event_type)
+        elif parts.scheme.lower() == WebhookSchemes.AWS_SQS:
+            send_webhook_using_aws_sqs(
+                target_url, message, domain, signature, event_type
+            )
+        elif parts.scheme.lower() == WebhookSchemes.GOOGLE_CLOUD_PUBSUB:
+            send_webhook_using_google_cloud_pubsub(
+                target_url, message, domain, signature, event_type
+            )
+        else:
+            raise ValueError("Unknown webhook scheme: %r" % (parts.scheme,))
+        logger.debug(
+            "[Webhook ID:%r] Payload sent to %r for event %r",
+            webhook_id,
+            target_url,
+            event_type,
+        )
 
 
 def send_webhook_request_sync(target_url, secret, event_type, data: str):
